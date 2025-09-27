@@ -27,7 +27,9 @@
 #include <IridiumSBD.h>
 #include "pins.h"
 
+#ifdef ENABLE_DEBUG
 SoftwareSerial xbeeSerial(PIN_XBEE_SERIAL_RX, PIN_XBEE_SERIAL_TX);
+#endif
 SoftwareSerial gpsSerial(PIN_GPS_SERIAL_RX, PIN_GPS_SERIAL_TX);
 TinyGPSPlus gps;
 IridiumSBD modem(Serial);
@@ -36,11 +38,12 @@ uint8_t unit_id = 17;
 char tx_buffer[65];
 uint8_t rx_buffer[65];
 
-// Determine the telemetry interval, 2 minutes for the first 90 minutes, then
-// down to every 10 minutes.
-uint32_t fast_telemetry_ms = 120000;
-uint32_t slow_telemetry_ms = 600000;
-uint32_t n_packets_change_rate = 90 / (fast_telemetry_ms / 60 / 1000);
+// Telemetry Intervals
+uint32_t rate_1_telemetry_ms = 60000; // 1 minute
+uint32_t rate_2_telemetry_ms = 300000; // 5 minutes
+uint32_t rate_3_telemetry_ms = 900000; // 15 minutes
+uint32_t rate_4_telemetry_ms = 3600000; // 60 minutes
+uint32_t rate_5_telemetry_ms = 7200000; // 120 minutes
 
 void(* resetFunc) (void) = 0; //declare reset function @ address 0
 
@@ -192,7 +195,9 @@ void setup()
 
   // Serial
   Serial.begin(19200);
+  #ifdef ENABLE_DEBUG
   xbeeSerial.begin(9600);
+  #endif
   gpsSerial.begin(9600);
   delay(1000);
 
@@ -247,18 +252,8 @@ void tx_rx_tracking()
   double lat = gps.location.lat();
   double lon = gps.location.lng();
   double alt = gps.altitude.meters();
-  /*
-  char lat_buffer[12];
-  char lon_buffer[12];
-  char alt_buffer[12];
-  dtostrf(lat, 6, 4, lat_buffer);
-  dtostrf(lon, 6, 4, lon_buffer);
-  dtostrf(alt, 5, 1, alt_buffer);
-  */
 
   sprintf(tx_buffer, "%lu,%d,%.4f,%.4f,%.1f\r", millis(), unit_id, lat, lon, alt);
-  //sprintf(tx_buffer, "%lu,%d,%s,%s,%s\r", millis(), unit_id, lat_buffer, lon_buffer, alt_buffer);
-  size_t rx_buffer_size = sizeof(rx_buffer);
 
   #ifdef ENABLE_DEBUG
   xbeeSerial.print("Iridium sending: ");
@@ -266,7 +261,7 @@ void tx_rx_tracking()
   #endif
 
   #ifdef ENABLE_IRIDIUM
-  err = modem.sendReceiveSBDText(tx_buffer, rx_buffer, rx_buffer_size);
+  err = modem.sendSBDText(tx_buffer);
   if (err != ISBD_SUCCESS)
   {
     #ifdef ENABLE_DEBUG
@@ -279,43 +274,6 @@ void tx_rx_tracking()
   #ifdef ENABLE_DEBUG
   xbeeSerial.print("Iridium send complete");
   #endif
-
-  // Transmit anything that was in the rx buffer via the xBee link - repeat it
-  // 3 times to be sure it goes through in a noisy environment.
-  uint8_t char_size = 0;
-  for (uint8_t i=0; i < 53; i++)
-  {
-    if (rx_buffer[i] != 0x00)
-    {
-      char_size += 1;
-    }
-    else
-    {
-      break;
-    }
-  }
-
-  #ifdef ENABLE_DEBUG
-  xbeeSerial.print("Iridium Buffer Length ");
-  xbeeSerial.println(char_size);
-  #endif
-
-  if (char_size > 4)
-  {
-    for (int j=0; j<3; j++)
-      {
-        for (size_t i=0; i<char_size; i++)
-        {
-          xbeeSerial.write(rx_buffer[i]);
-        }
-        delay(30000);
-      }
-  }
-  else
-  {
-    clear_buffers();
-    rx_buffer_size = 0;
-  }
 }
 
 void loop()
@@ -330,10 +288,30 @@ void loop()
   // Feed the GPS characters to the parser so we are always up to date
   update_gps();
 
-  uint32_t TELEMETRY_MS = slow_telemetry_ms;
-  if (number_packets_sent < n_packets_change_rate)
+  uint32_t TELEMETRY_MS = 1000;
+  if (millis() > 18000000) // Hours 5+ Every 2 hours
   {
-    TELEMETRY_MS = fast_telemetry_ms;
+    TELEMETRY_MS = rate_5_telemetry_ms;
+  }
+
+  else if (millis() > 7200000) //Hours 2-5 Every 1 hour
+  {
+    TELEMETRY_MS = rate_4_telemetry_ms;
+  }
+
+  else if (millis() > 3600000) //Hours 1-2 Every 15 minutes
+  {
+    TELEMETRY_MS = rate_3_telemetry_ms;
+  }
+
+  else if (millis() > 600000) // Minutes 10-60 Every 5 minutes
+  {
+    TELEMETRY_MS = rate_2_telemetry_ms;
+  }
+
+  else //Minutes 0-10 - Every minute
+  {
+    TELEMETRY_MS = rate_1_telemetry_ms;
   }
 
   // If it's been more than the set interval since we last sent telemetry - we do it!

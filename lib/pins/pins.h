@@ -11,5 +11,6 @@ const uint8_t PIN_XBEE_SERIAL_RX = 4;
 const uint8_t PIN_LED_ACTIVITY = 13;
 const uint8_t PIN_GPS_PPS = 6;
 const uint8_t PIN_RB_NETWORK = 7;
+const uint8_t PIN_RB_SLEEP = 8;
 
 #endif
