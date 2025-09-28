@@ -9,6 +9,9 @@
  * the instruments.
  * 
  * V1.1 Sept 28 2021
+ * 
+ * AVR Dude Flash: avrdude -p m328p -c avrispmkII -P usb -U flash:w:firmware.hex:i
+ * 
  */
 
 // Uncomment the next line to send all messages out via XBee for debugging/testing
@@ -38,7 +41,7 @@ uint8_t unit_id = 17;
 char tx_buffer[65];
 uint8_t rx_buffer[65];
 
-// Telemetry Intervals
+// Telemetry Intervals 
 uint32_t rate_1_telemetry_ms = 60000; // 1 minute
 uint32_t rate_2_telemetry_ms = 300000; // 5 minutes
 uint32_t rate_3_telemetry_ms = 900000; // 15 minutes
@@ -175,12 +178,29 @@ void update_gps()
   uint8_t read_cnt = 0;
   while(gpsSerial.available() && (read_cnt < 245))
   {
-    digitalWrite(PIN_LED_ACTIVITY, HIGH);
     char c = gpsSerial.read();
     gps.encode(c);
     read_cnt += 1;
   }
-  digitalWrite(PIN_LED_ACTIVITY, LOW);
+}
+
+void modemOn()
+{
+  /*
+   * High impedance the input pin so the modem goes to active 
+   */
+  pinMode(PIN_RB_SLEEP, INPUT);
+  delay(1000);  
+  modem.begin(); // re-sync AT interface after waking
+}
+
+void modemOff()
+{
+  /*
+   * Drive the input pin low to put the modem to sleep
+   */
+  pinMode(PIN_RB_SLEEP, OUTPUT);
+  digitalWrite(PIN_RB_SLEEP, LOW);
 }
 
 void setup()
@@ -189,6 +209,8 @@ void setup()
   pinMode(PIN_LED_ACTIVITY, OUTPUT);
   pinMode(PIN_GPS_PPS, INPUT);
   pinMode(PIN_RB_NETWORK, INPUT);
+  modemOn();
+
 
   // Turn activity on to show we're booting
   //digitalWrite(PIN_LED_ACTIVITY, HIGH);
@@ -206,11 +228,15 @@ void setup()
   // shown to be wrong, we'll asssume this is setting things to high altitude mode.
   setDynamicMode6(); 
 
-  // Spin for about 30 seconds to let the GPS get a lock
+  // Spin for about 60 seconds to let the GPS get a lock
   uint32_t start_warmup = millis();
-  while ((millis() - start_warmup) < 30000)
+  while ((millis() - start_warmup) < 60000)
   {
     update_gps();
+    digitalWrite(PIN_LED_ACTIVITY, HIGH);
+    delay(100);
+    digitalWrite(PIN_LED_ACTIVITY, LOW);
+    delay(100);
   }
 
   #ifdef ENABLE_DEBUG
@@ -278,6 +304,14 @@ void tx_rx_tracking()
 
 void loop()
 {
+  static uint32_t last_led_millis = 0;
+  if (millis() - last_led_millis > 5000)
+  {
+    last_led_millis = millis();
+    digitalWrite(PIN_LED_ACTIVITY, HIGH);
+    delay(20);
+    digitalWrite(PIN_LED_ACTIVITY, LOW);
+  }
 
   // The main loop updates the GPS and every set interval runs the satellite modem
   // transmit/receive function to send position and check messages.
@@ -289,22 +323,22 @@ void loop()
   update_gps();
 
   uint32_t TELEMETRY_MS = 1000;
-  if (millis() > 18000000) // Hours 5+ Every 2 hours
+  if (millis() > 18010000) // Hours 5+ Every 2 hours
   {
     TELEMETRY_MS = rate_5_telemetry_ms;
   }
 
-  else if (millis() > 7200000) //Hours 2-5 Every 1 hour
+  else if (millis() > 7210000) //Hours 2-5 Every 1 hour
   {
     TELEMETRY_MS = rate_4_telemetry_ms;
   }
 
-  else if (millis() > 3600000) //Hours 1-2 Every 15 minutes
+  else if (millis() > 3610000) //Hours 1-2 Every 15 minutes
   {
     TELEMETRY_MS = rate_3_telemetry_ms;
   }
 
-  else if (millis() > 600000) // Minutes 10-60 Every 5 minutes
+  else if (millis() > 610000) // Minutes 10-60 Every 5 minutes
   {
     TELEMETRY_MS = rate_2_telemetry_ms;
   }
@@ -317,10 +351,15 @@ void loop()
   // If it's been more than the set interval since we last sent telemetry - we do it!
   if (((millis() - last_tx_millis) > TELEMETRY_MS) || first_tx)
   {
+    modemOn();
     number_packets_sent += 1;
     last_tx_millis = millis();
     first_tx = 0;
     tx_rx_tracking();
+    if (TELEMETRY_MS >= rate_3_telemetry_ms)
+    {
+      modemOff();
+    }
     #ifdef ENABLE_DEBUG
     xbeeSerial.println("Done with telemetry if");
     #endif
