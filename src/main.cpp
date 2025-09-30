@@ -28,6 +28,7 @@
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
 #include <IridiumSBD.h>
+#include <Adafruit_SleepyDog.h>
 #include "pins.h"
 
 #ifdef ENABLE_DEBUG
@@ -176,7 +177,7 @@ void update_gps()
 {
   // Read in characters from the GPS and parse into nice objects!
   uint8_t read_cnt = 0;
-  while(gpsSerial.available() && (read_cnt < 245))
+  while(gpsSerial.available())// && (read_cnt < 245))
   {
     char c = gpsSerial.read();
     gps.encode(c);
@@ -205,16 +206,6 @@ void modemOff()
 
 void setup()
 {
-  // Pin Setup
-  pinMode(PIN_LED_ACTIVITY, OUTPUT);
-  pinMode(PIN_GPS_PPS, INPUT);
-  pinMode(PIN_RB_NETWORK, INPUT);
-  modemOn();
-
-
-  // Turn activity on to show we're booting
-  //digitalWrite(PIN_LED_ACTIVITY, HIGH);
-
   // Serial
   Serial.begin(19200);
   #ifdef ENABLE_DEBUG
@@ -222,6 +213,13 @@ void setup()
   #endif
   gpsSerial.begin(9600);
   delay(1000);
+
+  // Pin Setup
+  pinMode(PIN_LED_ACTIVITY, OUTPUT);
+  pinMode(PIN_GPS_PPS, INPUT);
+  pinMode(PIN_RB_NETWORK, INPUT);
+  pinMode(PIN_RB_SLEEP, INPUT); // Power on modem - leave begin for later
+  
 
   // Make sure the GPS is in high altitude mode - Normally we'd look for the ACK, but we're
   // missing it with SoftwareSerial I think - same code works on the control paddle. Until
@@ -234,9 +232,9 @@ void setup()
   {
     update_gps();
     digitalWrite(PIN_LED_ACTIVITY, HIGH);
-    delay(100);
+    delay(20);
     digitalWrite(PIN_LED_ACTIVITY, LOW);
-    delay(100);
+    delay(1000);
   }
 
   #ifdef ENABLE_DEBUG
@@ -304,68 +302,72 @@ void tx_rx_tracking()
 
 void loop()
 {
+  // --- LED heartbeat (kept simple; uses real millis) ---
   static uint32_t last_led_millis = 0;
-  if (millis() - last_led_millis > 5000)
-  {
+  if (millis() - last_led_millis > 5000) {
     last_led_millis = millis();
     digitalWrite(PIN_LED_ACTIVITY, HIGH);
     delay(20);
     digitalWrite(PIN_LED_ACTIVITY, LOW);
   }
 
-  // The main loop updates the GPS and every set interval runs the satellite modem
-  // transmit/receive function to send position and check messages.
-  static uint32_t last_tx_millis = 0;
-  static char first_tx = 1;
-  static uint32_t number_packets_sent = 0;
+  // --- Logical time that advances even while we deep-sleep ---
+  // We track "slept" time and add it to millis() to get logical_now.
+  static uint32_t slept_accum_ms = 0;   // total ms we've slept so far
+  uint32_t logical_now = millis() + slept_accum_ms;
 
-  // Feed the GPS characters to the parser so we are always up to date
-  update_gps();
+  // --- TX cadence state ---
+  static uint32_t last_tx_logical = 0;  // last TX time in *logical* ms
+  static bool first_tx = true;
 
-  uint32_t TELEMETRY_MS = 1000;
-  if (millis() > 18010000) // Hours 5+ Every 2 hours
-  {
-    TELEMETRY_MS = rate_5_telemetry_ms;
-  }
+  // --- Compute cadence ladder using logical time ---
+  uint32_t TELEMETRY_MS;
+  if      (logical_now > 18010000UL) TELEMETRY_MS = rate_5_telemetry_ms; // ≥ ~5h -> 2h
+  else if (logical_now > 7210000UL)  TELEMETRY_MS = rate_4_telemetry_ms; // 2–5h -> 1h
+  else if (logical_now > 3610000UL)  TELEMETRY_MS = rate_3_telemetry_ms; // 1–2h -> 15m
+  else if (logical_now > 610000UL)   TELEMETRY_MS = rate_2_telemetry_ms; // 10–60m -> 5m
+  else                               TELEMETRY_MS = rate_1_telemetry_ms; // 0–10m -> 1m
 
-  else if (millis() > 7210000) //Hours 2-5 Every 1 hour
-  {
-    TELEMETRY_MS = rate_4_telemetry_ms;
-  }
+  // --- Decide if we're in the pre-TX window (stay awake ≥15 s before TX) ---
+  int32_t until_tx = (int32_t)((last_tx_logical + TELEMETRY_MS) - logical_now);
+  bool pre_tx = first_tx || (until_tx <= 15000);  // 15 s pre-TX
 
-  else if (millis() > 3610000) //Hours 1-2 Every 15 minutes
-  {
-    TELEMETRY_MS = rate_3_telemetry_ms;
-  }
-
-  else if (millis() > 610000) // Minutes 10-60 Every 5 minutes
-  {
-    TELEMETRY_MS = rate_2_telemetry_ms;
-  }
-
-  else //Minutes 0-10 - Every minute
-  {
-    TELEMETRY_MS = rate_1_telemetry_ms;
-  }
-
-  // If it's been more than the set interval since we last sent telemetry - we do it!
-  if (((millis() - last_tx_millis) > TELEMETRY_MS) || first_tx)
-  {
-    modemOn();
-    number_packets_sent += 1;
-    last_tx_millis = millis();
-    first_tx = 0;
-    tx_rx_tracking();
-    if (TELEMETRY_MS >= rate_3_telemetry_ms)
-    {
-      modemOff();
+  // --- GPS parsing ---
+  if (pre_tx) {
+    // Stay fully awake and parse continuously so we have a recent fix.
+    update_gps();
+  } else {
+    // Cruise: brief parse burst, then deep sleep 2–3 s.
+    uint32_t t0 = millis();
+    while (millis() - t0 < 200) {  // ~200 ms of parsing
+      update_gps();
     }
-    #ifdef ENABLE_DEBUG
-    xbeeSerial.println("Done with telemetry if");
-    #endif
+    // MCU POWER-DOWN; returns actual ms slept (millis() is paused while asleep)
+    uint32_t slept = Watchdog.sleep(3000);  // ~3 s nap
+    slept_accum_ms += slept;                // advance logical time
+    // After waking, loop() continues; no serial/pin re-init needed.
   }
 
+  // --- Time to transmit? Use logical time for the comparison ---
+  if (first_tx || (int32_t)(logical_now - last_tx_logical) >= (int32_t)TELEMETRY_MS) {
+    // Wake modem if you’ve been sleeping it elsewhere; add a small settle + begin()
+    modemOn();              // drive SLEEP pin HIGH if using active-high wake
+
+    tx_rx_tracking();       // build + send SBD text
+
+    // Optional: sleep modem for long rungs
+    if (TELEMETRY_MS >= rate_3_telemetry_ms) { // 15m / 60m / 120m
+      modemOff();          // drive SLEEP pin LOW (active-low sleep)
+    }
+
+    // Tiny confirmation blink
+    digitalWrite(PIN_LED_ACTIVITY, HIGH); delay(60); digitalWrite(PIN_LED_ACTIVITY, LOW);
+
+    last_tx_logical = logical_now;  // mark TX time in logical ms
+    first_tx = false;
+  }
 }
+
 
 #if DIAGNOSTICS
 void ISBDConsoleCallback(IridiumSBD *device, char c)
